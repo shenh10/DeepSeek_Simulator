@@ -20,7 +20,8 @@ def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
         s_q = query.shape[-2]
         s_k = key.shape[-2]
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
-        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
+        temp_mask = torch.ones(
+            s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weight += attn_bias
@@ -32,7 +33,8 @@ def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
 def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
     x, y = x.double(), y.double()
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
-    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    cos_diff = 1 - 2 * (x * y).sum().item() / \
+        max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     assert cos_diff < 1e-5
@@ -44,7 +46,8 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
     if varlen:
         for i in range(b):
-            cache_seqlens[i] = max(random.normalvariate(mean_sk, mean_sk / 2), s_q)
+            cache_seqlens[i] = max(
+                random.normalvariate(mean_sk, mean_sk / 2), s_q)
     total_seqlens = cache_seqlens.sum().item()
     mean_seqlens = cache_seqlens.float().mean().int().item()
     max_seqlen = cache_seqlens.max().item()
@@ -122,17 +125,21 @@ def main(torch_dtype):
     random.seed(0)
 
     h_kv = 1
-    d, dv = 576, 512
+    config = TestConfig()
+    d, dv = config.model_config.d_kv_compression + \
+        config.model_config.d_r, config.model_config.d_kv_compression
     causal = True
 
-    config = TestConfig()
-
-    for b in config.b_mlas:
+    b_and_m_per_groups = config.generate_b_and_m_per_groups()
+    m_set = sorted(set([b_mla for d, tp, num_groups, b_mla,
+                   m_per_group in b_and_m_per_groups]))
+    for b in m_set:
         for s in [config.s]:
-            for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
+            for h_q in [math.ceil(config.model_config.q_head / tp) for tp in config.get_tp_configs()]:
                 for s_q in [1, 2]:  # MTP = 1, 2
                     for varlen in [False, True]:
-                        test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen)
+                        test_flash_mla(b, s_q, s, h_q, h_kv,
+                                       d, dv, causal, varlen)
 
 
 if __name__ == "__main__":

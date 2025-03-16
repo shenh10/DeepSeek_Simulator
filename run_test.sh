@@ -36,6 +36,7 @@ fi
 mla_out=$OUTPUT_FOLDER/${PREFIX}_mla.csv
 dense_gemm_out=$OUTPUT_FOLDER/${PREFIX}_dense_gemm.csv
 group_gemm_out=$OUTPUT_FOLDER/${PREFIX}_group_gemm.csv
+batch_gemm_out=$OUTPUT_FOLDER/${PREFIX}_batch_gemm.csv
 
 # 定义颜色  
 GREEN='\033[0;32m'  
@@ -69,13 +70,14 @@ print_success "FlashMLA results dumped to: $mla_out"
 print_header "Profiling DeepGemm"  
 print_step "Running DeepGemm profiling..."  
 python python/test_decode_gemms.py --output-dir $OUTPUT_FOLDER --prefix ${PREFIX}_  
-print_success "DeepGemm results dumped to:\n  ├─ $dense_gemm_out\n  └─ $group_gemm_out"  
+print_success "DeepGemm results dumped to:\n  ├─ $dense_gemm_out\n  └─ $group_gemm_out\n └─ $batch_gemm_out"  
 
 # Process final result  
 print_header "Processing Output Tables"  
 print_step "Generating final results..."  
 python python/process_table.py --dense_gemm $dense_gemm_out \
                        --group_gemm $group_gemm_out \
+                       --batch_gemm $batch_gemm_out \
                        --mla $mla_out \
                        --output_path $OUTPUT_FOLDER \
                        --output_prefix ${PREFIX}-  

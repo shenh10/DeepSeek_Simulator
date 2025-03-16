@@ -4,12 +4,20 @@ import math
 import os
 import random
 import torch
-from typing import Tuple, Callable  
+from typing import Tuple, Callable
+from enum import Enum
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, set_num_sms
 
 from common import TestConfig
+
+
+class Mode(Enum):
+    GROUP = 0
+    BATCH = 1
+    BASE = 2
+
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
@@ -22,7 +30,8 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
+    x_padded = torch.zeros(
+        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
@@ -42,18 +51,29 @@ def construct(m: int, k: int, n: int) -> \
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
-def construct_bmm(b_lhs: int, b_rhs: int, m: int, k: int, n: int) -> \
-        Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = x @ y.t()
 
-    x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
-    # Transpose earlier so that the testing will not trigger transposing kernels
-    x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-    return x_fp8, y_fp8, out, ref_out
+def to_float8(x, dtype=torch.float8_e4m3fn):
+    finfo = torch.finfo(dtype)
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    scale = finfo.max / amax
+    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    return x_scl_sat.to(dtype), scale.float().reciprocal()
 
+
+def construct_bmm(b: int, m: int, k: int, n: int) -> \
+        Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor],
+              Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    x = torch.randn((b, m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((b, n, k), device='cuda', dtype=torch.bfloat16)
+    out = torch.empty((b, m, n), device='cuda', dtype=torch.bfloat16)
+
+    y = y.transpose(-2, -1)
+    ref_out = torch.bmm(x, y)
+
+    x_fp8 = to_float8(x)
+    y_fp8 = to_float8(y)
+    return x, y, x_fp8, y_fp8, out, ref_out
 
 
 def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) -> \
@@ -64,8 +84,10 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     ref_out = torch.einsum('gmk,gnk->gmn', x, y)
 
     assert m % 4 == 0, f'TMA alignment error: {m}'
-    x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty((num_groups, m, k // 128), device='cuda', dtype=torch.float))
-    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cuda', dtype=torch.float))
+    x_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty(
+        (num_groups, m, k // 128), device='cuda', dtype=torch.float))
+    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty(
+        (num_groups, (n + 127) // 128, k // 128), device='cuda', dtype=torch.float))
     for i in range(num_groups):
         x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
@@ -79,325 +101,459 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
-class PerformanceLogger:  
-    def __init__(self, base_csv_file: str = 'performance_metrics.csv'):  
-        # 为两种不同的日志创建不同的文件  
-        self.base_file = base_csv_file  
-        self.full_file = base_csv_file.replace('dense', 'group')
-        self.base_file_exists = os.path.isfile(self.base_file)  
-        self.full_file_exists = os.path.isfile(self.full_file)  
-        if self.base_file_exists:  
-            os.remove(self.base_file)  
-            self.base_file_exists = False  
-            
-        if self.full_file_exists:  
-            os.remove(self.full_file)  
-            self.full_file_exists = False 
 
-    def log_full(self,  
-                 matrix_idx: int,  
-                 num_groups: int,  
-                 m: int,  
-                 n: int,  
-                 k: int,  
-                 t: float,  
-                 d: int,  
-                 b_mla: int,  
-                 m_per_group: int,  
-                 print_console: bool = True) -> None:  
-        """完整版本的logger，包含所有字段"""  
-        # 计算性能指标  
-        time_us = t * 1e6  
-        throughput_TFLOPS = 2 * num_groups * m * n * k / t / 1e12  
-        bandwidth_GBps = (num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t  
+class PerformanceLogger:
+    def __init__(self, base_csv_file: str = 'performance_metrics.csv'):
+        # 为两种不同的日志创建不同的文件
+        self.base_file, self.base_file_exists = self.create_file(base_csv_file)
+        self.batch_file, self.batch_file_exists = self.create_file(
+            base_csv_file, replace=True, tag='batch')
+        self.group_file, self.group_file_exists = self.create_file(
+            base_csv_file, replace=True, tag='group')
 
-        # 打印到控制台，包含所有字段  
-        if print_console:  
-            print(f' > Performance d={d:2}, num_groups={num_groups:2}, b_mla={b_mla:4}, '  
-                  f'm_per_group={m_per_group:4}, matrix_idx={matrix_idx:2}, '  
-                  f'm={m:4}, n={n:4}, k={k:4}): {time_us:4.0f} us | '  
-                  f'throughput: {throughput_TFLOPS:4.0f} TFLOPS, '  
-                  f'{bandwidth_GBps:4.0f} GB/s')  
+    def create_file(self, base_csv_file, replace=False, tag=''):
+        if replace:
+            new_file = base_csv_file.replace('dense', tag)
+        else:
+            new_file = base_csv_file
+        if os.path.isfile(new_file):
+            os.remove(new_file)
+        return new_file, False
 
-        # 写入CSV文件  
-        with open(self.full_file, 'a', newline='') as f:  
-            writer = csv.writer(f)  
-            if not self.full_file_exists:  
-                headers = [  
-                    'd',  
-                    'num_groups',  
-                    'b_mla',  
-                    'm_per_group',  
-                    'matrix_idx',  
-                    'm',  
-                    'n',  
-                    'k',  
-                    'time_us',  
-                    'throughput_TFLOPS',  
-                    'bandwidth_GBps'  
-                ]  
-                writer.writerow(headers)  
-                self.full_file_exists = True  
+    def log_group(self,
+                  matrix_idx: int,
+                  num_groups: int,
+                  m: int,
+                  n: int,
+                  k: int,
+                  t: float,
+                  tp: int,
+                  d: int,
+                  b_mla: int,
+                  m_per_group: int,
+                  print_console: bool = True) -> None:
+        """完整版本的logger，包含所有字段"""
+        # 计算性能指标
+        time_us = t * 1e6
+        throughput_TFLOPS = 2 * num_groups * m * n * k / t / 1e12
+        bandwidth_GBps = (num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t
 
-            row = [  
-                d,  
-                num_groups,  
-                b_mla,  
-                m_per_group,  
-                matrix_idx,  
-                m,  
-                n,  
-                k,  
-                f'{time_us:.0f}',  
-                f'{throughput_TFLOPS:.0f}',  
-                f'{bandwidth_GBps:.0f}'  
-            ]  
-            writer.writerow(row)  
+        # 打印到控制台，包含所有字段
+        if print_console:
+            print(f' > Performance d={d:2}, num_groups={num_groups:2}, b_mla={b_mla:4}, '
+                  f'm_per_group={m_per_group:4}, matrix_idx={matrix_idx:2}, tp={tp:2}, '
+                  f'm={m:4}, n={n:4}, k={k:4}): {time_us:4.0f} us | '
+                  f'throughput: {throughput_TFLOPS:4.0f} TFLOPS, '
+                  f'{bandwidth_GBps:4.0f} GB/s')
 
-    def log(self,  
-            matrix_idx: int,  
-            num_groups: int,  
-            m: int,  
-            n: int,  
-            k: int,  
-            t: float,  
-            print_console: bool = True) -> None:  
-        """基础版本的logger"""  
-        # 计算性能指标  
-        time_us = t * 1e6  
-        throughput_TFLOPS = 2 * num_groups * m * n * k / t / 1e12  
-        bandwidth_GBps = (num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t  
+        # 写入CSV文件
+        with open(self.group_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not self.group_file_exists:
+                headers = [
+                    'd',
+                    'num_groups',
+                    'b_mla',
+                    'm_per_group',
+                    'matrix_idx',
+                    'tp',
+                    'm',
+                    'n',
+                    'k',
+                    'time_us',
+                    'throughput_TFLOPS',
+                    'bandwidth_GBps'
+                ]
+                writer.writerow(headers)
+                self.group_file_exists = True
 
-        # 打印到控制台，只包含基础字段  
-        if print_console:  
-            print(f' > Performance matrix_idx={matrix_idx:2}, num_groups={num_groups:2}, '  
-                  f'm={m:4}, n={n:4}, k={k:4}): {time_us:4.0f} us | '  
-                  f'throughput: {throughput_TFLOPS:4.0f} TFLOPS, '  
-                  f'{bandwidth_GBps:4.0f} GB/s')  
+            row = [
+                d,
+                num_groups,
+                b_mla,
+                m_per_group,
+                matrix_idx,
+                tp,
+                m,
+                n,
+                k,
+                f'{time_us:.0f}',
+                f'{throughput_TFLOPS:.0f}',
+                f'{bandwidth_GBps:.0f}'
+            ]
+            writer.writerow(row)
 
-        # 写入CSV文件  
-        with open(self.base_file, 'a', newline='') as f:  
-            writer = csv.writer(f)  
-            if not self.base_file_exists:  
-                headers = [  
-                    'matrix_idx',  
-                    'num_groups',  
-                    'm',  
-                    'n',  
-                    'k',  
-                    'time_us',  
-                    'throughput_TFLOPS',  
-                    'bandwidth_GBps'  
-                ]  
-                writer.writerow(headers)  
-                self.base_file_exists = True  
+    def log_batch(self,
+                  matrix_idx: int,
+                  batch: int,
+                  m: int,
+                  n: int,
+                  k: int,
+                  t: float,
+                  tp: int,
+                  is_bf16: bool = True,
+                  print_console: bool = True) -> None:
+        """基础版本的logger"""
+        # 计算性能指标
+        if is_bf16:
+            t = t / 1.7  # discount factor to mimic fp8 performance
+            time_us = t * 1e6
+            throughput_TFLOPS = 2 * batch * m * n * k / t / 1e12
+            bandwidth_GBps = (batch * (m * k + k * n + m * n)) / 1e9 / t
+        else:
+            time_us = t * 1e6
+            throughput_TFLOPS = 2 * batch * m * n * k / t / 1e12
+            bandwidth_GBps = (batch * (m * k + k * n + m * n * 2)) / 1e9 / t
 
-            row = [  
-                matrix_idx,  
-                num_groups,  
-                m,  
-                n,  
-                k,  
-                f'{time_us:.0f}',  
-                f'{throughput_TFLOPS:.0f}',  
-                f'{bandwidth_GBps:.0f}'  
-            ]  
-            writer.writerow(row)  
+        # 打印到控制台，只包含基础字段
+        if print_console:
+            print(f' > Performance matrix_idx={matrix_idx:2}, tp={tp:2}, batch={batch:2}, '
+                  f'm={m:4}, n={n:4}, k={k:4}): {time_us:4.0f} us | '
+                  f'throughput: {throughput_TFLOPS:4.0f} TFLOPS, '
+                  f'{bandwidth_GBps:4.0f} GB/s')
 
-class GEMMTester:  
-    def __init__(self, logger: PerformanceLogger):  
-        self.logger = logger  
+        # 写入CSV文件
+        with open(self.batch_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not self.batch_file_exists:
+                headers = [
+                    'matrix_idx',
+                    'tp',
+                    'batch',
+                    'm',
+                    'n',
+                    'k',
+                    'time_us',
+                    'throughput_TFLOPS',
+                    'bandwidth_GBps'
+                ]
+                writer.writerow(headers)
+                self.batch_file_exists = True
 
-    def run_benchmark(self,   
-                     test_func: Callable,   
-                     matrix_idx: int,   
-                     num_groups: int,   
-                     m: int,   
-                     n: int,   
-                     k: int,  
-                     d: int = None,  
-                     b_mla: int = None,  
-                     m_per_group: int = None) -> None:  
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)  
-        
-        if all(x is not None for x in [d, b_mla, m_per_group]):  
-            self.logger.log_full(  
-                matrix_idx=matrix_idx,  
-                num_groups=num_groups,  
-                m=m,  
-                n=n,  
-                k=k,  
-                t=t,  
-                d=d,  
-                b_mla=b_mla,  
-                m_per_group=m_per_group,  
-                print_console=True  
-            )  
-        else:  
-            self.logger.log(  
-                matrix_idx=matrix_idx,  
-                num_groups=num_groups,  
-                m=m if matrix_idx != 3 else int(m / 128),  
-                n=n if matrix_idx != 3 else n * 128,
-                k=k,  
-                t=t,  
-                print_console=True  
-            )  
+            row = [
+                matrix_idx,
+                tp,
+                batch,
+                m,
+                n,
+                k,
+                f'{time_us:.0f}',
+                f'{throughput_TFLOPS:.0f}',
+                f'{bandwidth_GBps:.0f}'
+            ]
+            writer.writerow(row)
 
-    def test_gemm(self, config: TestConfig) -> None:  
-        print('Testing GEMM:')  
-        num_groups = 1  
+    def log_base(self,
+                 matrix_idx: int,
+                 m: int,
+                 n: int,
+                 k: int,
+                 t: float,
+                 tp: int,
+                 print_console: bool = True) -> None:
+        """基础版本的logger"""
+        # 计算性能指标
+        time_us = t * 1e6
+        throughput_TFLOPS = 2 * m * n * k / t / 1e12
+        bandwidth_GBps = (m * k + k * n + m * n * 2) / 1e9 / t
+
+        # 打印到控制台，只包含基础字段
+        if print_console:
+            print(f' > Performance matrix_idx={matrix_idx:2}, tp={tp:2},'
+                  f'm={m:4}, n={n:4}, k={k:4}): {time_us:4.0f} us | '
+                  f'throughput: {throughput_TFLOPS:4.0f} TFLOPS, '
+                  f'{bandwidth_GBps:4.0f} GB/s')
+
+        # 写入CSV文件
+        with open(self.base_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not self.base_file_exists:
+                headers = [
+                    'matrix_idx',
+                    'tp',
+                    'm',
+                    'n',
+                    'k',
+                    'time_us',
+                    'throughput_TFLOPS',
+                    'bandwidth_GBps'
+                ]
+                writer.writerow(headers)
+                self.base_file_exists = True
+
+            row = [
+                matrix_idx,
+                tp,
+                m,
+                n,
+                k,
+                f'{time_us:.0f}',
+                f'{throughput_TFLOPS:.0f}',
+                f'{bandwidth_GBps:.0f}'
+            ]
+            writer.writerow(row)
+
+
+class GEMMTester:
+    def __init__(self, logger: PerformanceLogger):
+        self.logger = logger
+
+    def run_benchmark(self,
+                      test_func: Callable,
+                      matrix_idx: int,
+                      m: int,
+                      n: int,
+                      k: int,
+                      *,
+                      compute_mode: Mode = Mode.BASE,
+                      tag: str = 'fp8_gemm',
+                      tp: int = 1,
+                      batch: int = None,
+                      d: int = None,
+                      b_mla: int = None,
+                      num_groups: int = 1,
+                      m_per_group: int = None,
+                      ) -> None:
+        t = bench_kineto(test_func, tag, suppress_kineto_output=True)
+
+        if compute_mode == Mode.GROUP:
+            self.logger.log_group(
+                matrix_idx=matrix_idx,
+                num_groups=num_groups,
+                m=m,
+                n=n,
+                k=k,
+                t=t,
+                tp=tp,
+                d=d,
+                b_mla=b_mla,
+                m_per_group=m_per_group,
+                print_console=True
+            )
+        elif compute_mode == Mode.BATCH:
+            self.logger.log_batch(
+                matrix_idx=matrix_idx,
+                batch=batch,
+                m=m,
+                n=n,
+                k=k,
+                t=t,
+                tp=tp,
+                is_bf16=True if tag in ["gemm_bf16", "nvjet_tst"] else False,
+                print_console=True
+            )
+        else:
+            self.logger.log_base(
+                matrix_idx=matrix_idx,
+                m=m,
+                n=n,
+                k=k,
+                t=t,
+                tp=tp,
+                print_console=True
+            )
+
+    def test_gemm(self, config: TestConfig) -> None:
+        print('Testing GEMM:')
+        num_groups = 1
         b_and_m_per_groups = config.generate_b_and_m_per_groups()
-        m_set = sorted(set([b_mla for d, num_groups, b_mla, m_per_group in b_and_m_per_groups]))
-        for m in m_set:  
-            for matrix_idx, k, n in [(1, 7168, 2112), (2, 1536, 24576),   
-                                   (4, 16384, 7168), (5, 7168, 4096),   
-                                   (6, 2048, 7168)]:  
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)  
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)  
-                diff = calc_diff(out, ref_out)  
-                assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'  
+        tp_vars = config.get_tp_configs()
+        m_set = sorted(
+            set([b_mla for d, tp, num_groups, b_mla, m_per_group in b_and_m_per_groups]))
 
-                def test_func():  
-                    x_fp8, y_fp8, out, ref_out = construct(m, k, n)  
-                    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)  
+        test_set = [(1, 1, 7168, 2112), (2, 1, 1536, 24576),
+                    (4, 1, 16384, 7168), (5, 1, 7168, 4096),
+                    (6, 1, 2048, 7168)]
 
-                self.run_benchmark(test_func, matrix_idx, num_groups, m, n, k)  
-        print()  
+        def add_tp_shapes(tp_vars, test_set):
+            update_set = []
+            for matrix_idx, tp, k, n in test_set:
+                update_set.append((matrix_idx, tp, k, n))
+                for t in tp_vars:
+                    if matrix_idx in [2]:
+                        # column slice
+                        update_set.append((matrix_idx, t, k, math.ceil(n / t)))
+                    elif matrix_idx in [4]:
+                        # row slice
+                        update_set.append((matrix_idx, t, math.ceil(k / t), n))
+            return update_set
 
-    def test_m_grouped_gemm_contiguous(self, config: TestConfig) -> None:  
-        print('Testing grouped contiguous GEMM:')  
-        num_groups = 1  
+        updated_set = sorted(set(add_tp_shapes(tp_vars, test_set)))
+        print(updated_set)
+        for m in m_set:
+            for matrix_idx, tp, k, n in updated_set:
+                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                diff = calc_diff(out, ref_out)
+                assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-        b_and_m_per_groups = config.generate_b_and_m_per_groups()
-        m_set = sorted(set([(3, b_mla * 128, 512, 128) for d, num_groups, b_mla, m_per_group in b_and_m_per_groups]))
-        for matrix_idx, m, k, n in m_set:  
-            x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)  
-            m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)  
-            m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)  
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)  
-            diff = calc_diff(out, ref_out)  
-            assert diff < 0.001, f'm={m * num_groups}, {k=}, {n=}, {diff:.5f}'  
+                def test_func():
+                    x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
-            def test_func():
-                x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)  
-                m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)  
-                m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)  
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)  
-
-            self.run_benchmark(test_func, matrix_idx, num_groups, m, n, k)  
-        print()  
-
-    def test_bmm(self) -> None:
-        print('Testing batch GEMM:')  
-        import torch.cuda.nvtx as nvtx  
-
-        a = torch.randn((64, 1, 512), device='cuda', dtype=torch.bfloat16)  
-        b = torch.randn((128, 512, 128), device='cuda', dtype=torch.bfloat16)
-        nvtx.range_push("matrix_multiplication")  # 开始标记  
-        result = torch.einsum('bij,kjl->bikl', a, b)
-        torch.cuda.synchronize()  # 确保 CUDA 操作完成  
-        nvtx.range_pop()  # 结束标记 
-        print(result[0, 0, 1, :])  
-
-
-    def test_m_grouped_gemm_masked(self, config: TestConfig) -> None:  
-        print('Testing grouped masked GEMM:')  
-        b_and_m_per_groups = config.generate_b_and_m_per_groups()  
-        for d, num_groups, b_mla, m_per_group in b_and_m_per_groups:  
-            for matrix_idx, k, n in ((7, 7168, 4096), (8, 2048, 7168)):  
-                masked_m_candidates = list(filter(  
-                    lambda candidate: candidate <= m_per_group,   
-                    (4, 8, 16, 32, 64, 128, 192, 256, 320, 384)  
-                ))  
-                
-                # Correctness testing  
-                for i in range(10):  
-                    x_fp8, y_fp8, out, ref_out = construct_grouped(  
-                        num_groups, m_per_group, k, n, is_masked=True  
-                    )  
-                    masked_m = torch.empty((num_groups,), device='cuda', dtype=torch.int)  
-                    for j in range(num_groups):
-                        try:
-                            masked_m[j] = random.choice(masked_m_candidates)  
-                        except:
-                            import pdb
-                            pdb.set_trace()
-                    expected_m = min(int(masked_m.float().mean()) + 1, m_per_group)  
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(  
-                        x_fp8, y_fp8, out, masked_m, expected_m  
-                    )  
-                    
-                    for j in range(num_groups):  
-                        diff = calc_diff(  
-                            out[j, :masked_m[j].item()],   
-                            ref_out[j, :masked_m[j].item()]  
-                        )  
-                        assert diff < 0.001, (  
-                            f'{m_per_group=}, {k=}, {n=}, {j=}, '  
-                            f'masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'  
-                        )  
-
-                def test_func():  
-                    x_fp8, y_fp8, out, ref_out = construct_grouped(  
-                        num_groups, m_per_group, k, n, is_masked=True  
-                    )  
-                    masked_m = torch.ones((num_groups,), device='cuda', dtype=torch.int) * m_per_group  
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(  
-                        x_fp8, y_fp8, out, masked_m, m_per_group  
-                    )  
-
-                self.run_benchmark(  
-                    test_func, matrix_idx, num_groups, m_per_group, n, k, d, b_mla, m_per_group  
-                )  
+                self.run_benchmark(test_func, matrix_idx, m, n, k,
+                                   tp=tp, compute_mode=Mode.BASE, tag='fp8_gemm')
         print()
 
-def parse_args():  
-    parser = argparse.ArgumentParser(description='GEMM Performance Testing')  
-    
-    # 添加输出目录参数  
-    parser.add_argument('--output-dir',   
-                       type=str,   
-                       default='.',  
-                       help='Directory to save output files (default: current directory)')  
-    
-    # 添加文件名前缀参数  
-    parser.add_argument('--prefix',   
-                       type=str,   
-                       default='',  
-                       help='Prefix for output files (default: no prefix)')  
-    
-    args = parser.parse_args()  
-    
-    # 确保输出目录存在  
-    os.makedirs(args.output_dir, exist_ok=True)  
-    
-    return args 
+    def test_bmm(self, config: TestConfig, *, use_flashinfer_bmm: bool = False) -> None:
+        import torch.cuda.nvtx as nvtx
+        print('Testing batch GEMM:')
+        if use_flashinfer_bmm:
+            from flashinfer import bmm_fp8
+        b_and_m_per_groups = config.generate_b_and_m_per_groups()
+        tp_vars = config.get_tp_configs()
+        m_set = sorted(
+            set([b_mla for d, tp, num_groups, b_mla, m_per_group in b_and_m_per_groups]))
+        test_set = [(3, 1, 128, 128, 512), (9, 1, 128, 512, 128)]
+        # test_set = [(3, 1, 128, 128, 512)]
+        # tp_vars = [1]
+        # m_set = [64]
 
-def main(): 
-    args = parse_args()  
+        def add_tp_shapes(tp_vars, test_set):
+            update_set = []
+            for matrix_idx, tp, b, k, n in test_set:
+                update_set.append((matrix_idx, tp, b, k, n))
+                for t in tp_vars:
+                    # column slice
+                    update_set.append((matrix_idx, t, math.ceil(b / t), k, n))
 
-    torch.backends.cuda.matmul.allow_tf32 = True  
-    torch.backends.cudnn.allow_tf32 = True  
-    torch.manual_seed(0)  
-    random.seed(0)  
+            return update_set
+        updated_set = sorted(set(add_tp_shapes(tp_vars, test_set)))
+        print(updated_set)
 
-    print('Library path:')  
-    print(f' > {deep_gemm.__path__}\n')  
+        for m in m_set:
+            for matrix_idx, tp, b, k, n in updated_set:
+                x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                    b, m, k, n)
+                if use_flashinfer_bmm:
+                    bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
+                            y_fp8[1], "torch.bfloat16", out)
+                    diff = calc_diff(out, ref_out)
+                    assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-    output_filename = f"{args.prefix}dense_gemm.csv" if args.prefix else "dense_gemm.csv"  
-    output_path = os.path.join(args.output_dir, output_filename)  
+                    def test_func():
+                        x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                            b, m, k, n)
+                        bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
+                                y_fp8[1], "torch.bfloat16", out)
+                    self.run_benchmark(test_func, matrix_idx,
+                                       m, n, k, Mode.BATCH, 'cutlass')
+                else:
+                    def test_func():
+                        x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                            b, m, k, n)
+                        # with nvtx.range("matmul"):
+                        out = torch.bmm(x_bf16, y_bf16)
+                        # torch.cuda.synchronize()
+                        # nvtx.range_pop()
+                    # test_func()
+                    try:
+                        self.run_benchmark(
+                            test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='gemm_bf16', batch=b)
+                    except:
+                        # H20 use a strange kernel named "nvjet_tst_176x64_64x7_1x1_v_bz_TNN" to perform
+                        self.run_benchmark(
+                            test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='nvjet_tst', batch=b)
 
-    # 初始化配置和测试器 
-    config = TestConfig()  
-    logger = PerformanceLogger(output_path)  
-    tester = GEMMTester(logger)  
+    def test_m_grouped_gemm_masked(self, config: TestConfig) -> None:
+        print('Testing grouped masked GEMM:')
+        b_and_m_per_groups = config.generate_b_and_m_per_groups()
+        for d, _, num_groups, b_mla, m_per_group in b_and_m_per_groups:
+            for matrix_idx, k, n in ((7, 7168, 4096), (8, 2048, 7168)):
+                masked_m_candidates = list(filter(
+                    lambda candidate: candidate <= m_per_group,
+                    (4, 8, 16, 32, 64, 128, 192, 256, 320, 384)
+                ))
 
-    # 运行测试  
+                # Correctness testing
+                for i in range(10):
+                    x_fp8, y_fp8, out, ref_out = construct_grouped(
+                        num_groups, m_per_group, k, n, is_masked=True
+                    )
+                    masked_m = torch.empty(
+                        (num_groups,), device='cuda', dtype=torch.int)
+                    for j in range(num_groups):
+                        masked_m[j] = random.choice(masked_m_candidates)
+                    expected_m = min(
+                        int(masked_m.float().mean()) + 1, m_per_group)
+                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                        x_fp8, y_fp8, out, masked_m, expected_m
+                    )
+
+                    for j in range(num_groups):
+                        diff = calc_diff(
+                            out[j, :masked_m[j].item()],
+                            ref_out[j, :masked_m[j].item()]
+                        )
+                        assert diff < 0.001, (
+                            f'{m_per_group=}, {k=}, {n=}, {j=}, '
+                            f'masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                        )
+
+                def test_func():
+                    x_fp8, y_fp8, out, ref_out = construct_grouped(
+                        num_groups, m_per_group, k, n, is_masked=True
+                    )
+                    masked_m = torch.ones(
+                        (num_groups,), device='cuda', dtype=torch.int) * m_per_group
+                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                        x_fp8, y_fp8, out, masked_m, m_per_group
+                    )
+
+                self.run_benchmark(
+                    test_func, matrix_idx, m_per_group, n, k, tp=1, compute_mode=Mode.GROUP, tag='fp8_gemm',
+                    d=d, b_mla=b_mla, num_groups=num_groups, m_per_group=m_per_group
+                )
+        print()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='GEMM Performance Testing')
+
+    # 添加输出目录参数
+    parser.add_argument('--output-dir',
+                        type=str,
+                        default='.',
+                        help='Directory to save output files (default: current directory)')
+
+    # 添加文件名前缀参数
+    parser.add_argument('--prefix',
+                        type=str,
+                        default='',
+                        help='Prefix for output files (default: no prefix)')
+
+    args = parser.parse_args()
+
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    return args
+
+
+def main():
+    args = parse_args()
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    output_filename = f"{args.prefix}dense_gemm.csv" if args.prefix else "dense_gemm.csv"
+    output_path = os.path.join(args.output_dir, output_filename)
+
+    # 初始化配置和测试器
+    config = TestConfig()
+    logger = PerformanceLogger(output_path)
+    tester = GEMMTester(logger)
+
+    # 运行测试
     tester.test_gemm(config)
-    tester.test_m_grouped_gemm_contiguous(config)  
     tester.test_m_grouped_gemm_masked(config)
-    # tester.test_bmm()
+    tester.test_bmm(config)
 
-if __name__ == '__main__':  
-    main()  
+
+if __name__ == '__main__':
+    main()
