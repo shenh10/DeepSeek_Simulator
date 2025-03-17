@@ -1,6 +1,7 @@
 # DeepSeek Simulator
 
-This is a simulator to mimic the possible performance of DeepSeek V3/R1 at different Hopper hardwares. Other hardware should provide Gemm/MLA kernels to adapt to this tool.
+This simulator emulates the potential performance of DeepSeek V3/R1 across various NVIDIA Hopper architectures. For compatibility with this tool, other hardware platforms need to implement their respective GEMM/MLA kernels.
+
 
 More info about this tool is show in my Chinese blog:
 - [DeepSeek V3/R1 推理效率分析（1）：关于DeepSeek V3/R1 Decoding吞吐极限的一些不负责任估计](https://zhuanlan.zhihu.com/p/27292649125)
