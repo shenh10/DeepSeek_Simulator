@@ -97,7 +97,7 @@ class ModelConfig:
 class TestConfig:
     device_nums: List[int] = None
     s: int = 5000
-    gpu: str = "H20-96"
+    gpu: str = "H800-80"
     model_config: ModelConfig = None
     tp_nums:  List[int] = None
     debug: bool = False
@@ -243,5 +243,5 @@ class TestConfig:
 
 
 if __name__ == '__main__':
-    config = TestConfig(gpu="H800-80", debug=True)
+    config = TestConfig(gpu="H20-96", debug=True)
     config.generate_b_and_m_per_groups()

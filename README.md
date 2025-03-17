@@ -2,6 +2,11 @@
 
 This is a simulator to mimic the possible performance of DeepSeek V3/R1 at different Hopper hardwares. Other hardware should provide Gemm/MLA kernels to adapt to this tool.
 
+More info about this tool is show in my Chinese blog:
+- [DeepSeek V3/R1 推理效率分析（1）：关于DeepSeek V3/R1 Decoding吞吐极限的一些不负责任估计](https://zhuanlan.zhihu.com/p/27292649125)
+- [DeepSeek V3/R1 推理效率分析（2）: DeepSeek 满血版逆向工程分析](https://zhuanlan.zhihu.com/p/29841050824)
+- [DeepSeek V3/R1 推理效率分析（3）：Decode 配置泛化讨论](https://zhuanlan.zhihu.com/p/29540042383)
+
 ## Installation
 
 ### Requirements
