@@ -2,7 +2,7 @@
 set -e
 
 OUTPUT_FOLDER=${OUTPUT_FOLDER:-"results"}
-PREFIX=${PREFIX:-"H800"}
+PREFIX=${PREFIX:-"MI300X"}
 
 function parse_mla_result_to_csv {
     # Create output CSV file with header
@@ -77,7 +77,6 @@ print_header "Processing Output Tables"
 print_step "Generating final results..."  
 python python/process_table.py --dense_gemm $dense_gemm_out \
                        --group_gemm $group_gemm_out \
-                       --batch_gemm $batch_gemm_out \
                        --mla $mla_out \
                        --output_path $OUTPUT_FOLDER \
                        --output_prefix ${PREFIX}-  

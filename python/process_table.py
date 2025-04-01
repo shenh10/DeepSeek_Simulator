@@ -8,11 +8,11 @@ from itertools import chain
 from common import TestConfig
 
 
-def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: str, mla_file: str, output_path: str, output_prefix: str):
+def process_data(dense_gemm_file: str, group_gemm_file: str, mla_file: str, output_path: str, output_prefix: str):
     # 读取输入文件
     dense_df = pd.read_csv(dense_gemm_file)
     group_df = pd.read_csv(group_gemm_file)
-    batch_df = pd.read_csv(batch_gemm_file)
+    # batch_df = pd.read_csv(batch_gemm_file)
     mla_df = pd.read_csv(mla_file)
 
     config = TestConfig()
@@ -27,10 +27,7 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
                                 ]['time_us'].iloc[0]) + \
             int(dense_df[(dense_df['m'] == b_mla) &
                          (dense_df['tp'] == tp) &
-                         (dense_df['matrix_idx'] == 2)]['time_us'].iloc[0]) + \
-            int(batch_df[(batch_df['m'] == b_mla) &
-                         (batch_df['tp'] == tp) &
-                         (batch_df['matrix_idx'] == 3)]['time_us'].iloc[0])
+                         (dense_df['matrix_idx'] == 2)]['time_us'].iloc[0])
         attn_time = int(mla_df[(mla_df['mean_sk'] == config.s) &
                         (mla_df['s_q'] == 1) &
                         (mla_df['b'] == b_mla) &
@@ -39,20 +36,17 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
         o_time = int(dense_df[
             (dense_df['m'] == b_mla) &
             (dense_df['tp'] == tp) &
-            (dense_df['matrix_idx'] == 4)]['time_us'].iloc[0]) + \
-            int(batch_df[(batch_df['m'] == b_mla) &
-                         (batch_df['tp'] == tp) &
-                         (batch_df['matrix_idx'] == 9)]['time_us'].iloc[0])
+            (dense_df['matrix_idx'] == 4)]['time_us'].iloc[0]) 
         shared_time = int(dense_df[(dense_df['m'] == b_mla) &
                                    (dense_df['matrix_idx'].isin([5, 6]))]['time_us'].sum())
         up_gemm = int(group_df[(group_df['d'] == d) &
                                (group_df['b_mla'] == b_mla) &
                                (group_df['m_per_group'] == m_per_group) &
                                (group_df['matrix_idx'] == 7)]['time_us'].iloc[0])
-        down_gemm = int(group_df[(group_df['d'] == d) &
-                                 (group_df['m_per_group'] == m_per_group) &
-                                 (group_df['b_mla'] == b_mla) &
-                                 (group_df['matrix_idx'] == 8)]['time_us'].iloc[0])
+        # down_gemm = int(group_df[(group_df['d'] == d) &
+        #                          (group_df['m_per_group'] == m_per_group) &
+        #                          (group_df['b_mla'] == b_mla) &
+        #                          (group_df['matrix_idx'] == 8)]['time_us'].iloc[0])
 
         dispatch_alltoall = int(
             config.calculate_alltoall_time(d, tp, b_mla, True))
@@ -65,15 +59,15 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
         # 计算两种模式下的层时间
         # Two microbatch overlapping
         t_moe_layer_two = int(2 * (max(dispatch_alltoall, shared_time + qkv_time) +
-                              up_gemm + down_gemm +
+                              up_gemm  +
                               max(attn_time + o_time + allreduce, combine_alltoall)))
         t_dense_layer_two = int(
-            2 * (shared_time + qkv_time + up_gemm + down_gemm + attn_time + o_time + allreduce))
+            2 * (shared_time + qkv_time + up_gemm + attn_time + o_time + allreduce))
         # Single batch comp-compute overlapping
-        t_moe_layer_single = int(max(dispatch_alltoall, shared_time) + qkv_time + up_gemm +
-                                 max(down_gemm, combine_alltoall) + attn_time + o_time + allreduce)
+        t_moe_layer_single = int(max(dispatch_alltoall, shared_time) + qkv_time +
+                                 max(up_gemm, combine_alltoall) + attn_time + o_time + allreduce)
         t_dense_layer_single = int(
-            shared_time + qkv_time + up_gemm + down_gemm + attn_time + o_time + allreduce)
+            shared_time + qkv_time + up_gemm + attn_time + o_time + allreduce)
 
         # 计算TPOT和吞吐量
         tpot_two = int((t_moe_layer_two * 58 + t_dense_layer_two * 3) / 1000)
@@ -93,7 +87,7 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
             'O(us)': o_time,
             'Shared(us)': shared_time,
             'Up_Gemm(us)': up_gemm,
-            'Down_Gemm(us)': down_gemm,
+            'Down_Gemm(us)': 0,
             'Dispatch_AlltoAll(us)': dispatch_alltoall,
             'Combine_AlltoAll(us)': combine_alltoall,
             'AllReduce(us)': allreduce,
@@ -147,8 +141,8 @@ def main():
                         help='Path to dense_gemm.csv')
     parser.add_argument('--group_gemm', required=True,
                         help='Path to group_gemm.csv')
-    parser.add_argument('--batch_gemm', required=True,
-                        help='Path to batch_gemm.csv')
+    # parser.add_argument('--batch_gemm', required=True,
+    #                     help='Path to batch_gemm.csv')
     parser.add_argument('--mla', required=True, help='Path to mla.csv')
     parser.add_argument('--output_path',
                         default='.',
@@ -159,7 +153,7 @@ def main():
 
     args = parser.parse_args()
 
-    process_data(args.dense_gemm, args.group_gemm, args.batch_gemm,
+    process_data(args.dense_gemm, args.group_gemm, #args.batch_gemm,
                  args.mla, args.output_path, args.output_prefix)
 
 
