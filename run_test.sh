@@ -77,6 +77,7 @@ print_header "Processing Output Tables"
 print_step "Generating final results..."  
 python python/process_table.py --dense_gemm $dense_gemm_out \
                        --group_gemm $group_gemm_out \
+                       --batch_gemm $batch_gemm_out \
                        --mla $mla_out \
                        --output_path $OUTPUT_FOLDER \
                        --output_prefix ${PREFIX}-  

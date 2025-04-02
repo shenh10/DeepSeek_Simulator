@@ -124,14 +124,32 @@ def test_aiter_gemm_asm(dtype, m, n, k):
     gemm_a8w8_blockscale(x, weight, x_scale, w_scale, output)
 
 
+from aiter import batched_gemm_a8w8
+
+## TODO: fix the error from aiter bmm : RuntimeError: This GEMM is not supported!
 def test_aiter_batch_gemm(dtype, b, m, n, k):
     dim = (b, m, n, k)
     x = torch.randint(-20, 20, (b, m, k), dtype=torch.int8).cuda()
     weight = torch.randint(-20, 20, (b, n, k), dtype=torch.int8).cuda()
     x_scale = torch.rand([b, m, 1], dtype=torch.float32).cuda() + 1e-6
     w_scale = torch.rand([b, 1, n], dtype=torch.float32).cuda() + 1e-6
+    output = torch.zeros(
+            (b, m , n),
+            dtype=dtype,
+            device=x.device,
+        )
 
-    b, avg_b = aiter.batched_gemm_a8w8_CK(x, weight, x_scale, w_scale, None, dtype)
+    batched_gemm_a8w8(x, weight, x_scale, w_scale, output, None)
+
+
+# #TODO: bill fail back to torch.bmm 
+# # from /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py:L796
+def test_torch_batch_gemm(dtype, b, m, n, k):
+    dim = (b, m, n, k)
+    x = torch.randint(-20, 20, (b, m, k), dtype=dtype).cuda()
+    weight = torch.randint(-20, 20, (b, k, n), dtype=dtype).cuda()
+    q_nope_out = torch.bmm(x, weight)
+
 
 
 
@@ -527,10 +545,10 @@ class GEMMTester:
 
                 
                 def test_func():
-                        test_aiter_batch_gemm(torch.bfloat16, b, m, n, k)
+                    # test_aiter_batch_gemm(torch.bfloat16, b, m, n, k)
+                    test_torch_batch_gemm(torch.bfloat16, b, m, n, k)
 
-                self.run_benchmark(test_func, matrix_idx,
-                                    m, n, k, Mode.BATCH, 'cutlass') ## TODO: tag cutlass is wrong!!
+                self.run_benchmark(test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='Cijk_Ailk_Bljk_BBS_BH_Bias_HAS_SAV_UserArgs_MT', batch=b) ## TODO: tag cutlass is wrong!!
 
                 # x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
                 #     b, m, k, n)
@@ -668,7 +686,7 @@ def main():
     # 运行测试
     tester.test_gemm(config)
     tester.test_m_grouped_gemm_masked(config)
-    # tester.test_bmm(config)
+    tester.test_bmm(config)
 
 
 if __name__ == '__main__':
