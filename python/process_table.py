@@ -17,10 +17,14 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
 
     config = TestConfig()
     configs = config.generate_b_and_m_per_groups()
-
     results = []
     for d, tp, num_groups, b_mla, m_per_group in configs:
         # 获取各个组件的时间
+        tp_index = config.tp_nums.index(tp)
+        d_index = config.b_mla_and_device_pair[tp_index]['device_nums'].index(
+            d)
+        b_mla_peak = config.b_mla_and_device_pair[tp_index]['b_mla_peak'][d_index]
+
         qkv_time = int(dense_df[(dense_df['m'] == b_mla) &
                                 (dense_df['tp'] == 1) &
                                 (dense_df['matrix_idx'] == 1)
@@ -100,23 +104,24 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
 
         }
 
-        results.append({
-            **base_result,
-            't_{dense_layer}(us)': t_dense_layer_two,
-            't_{moe_layer}(us)': t_moe_layer_two,
-            'TPOT(ms)': tpot_two,
-            'Single-Device Throughput(Tokens/s)': throughput_two,
-            'mode': 'two-microbatch'
-        })
-
-        results.append({
-            **base_result,
-            't_{dense_layer}(us)': t_dense_layer_single,
-            't_{moe_layer}(us)': t_moe_layer_single,
-            'TPOT(ms)': tpot_single,
-            'Single-Device Throughput(Tokens/s)': throughput_single,
-            'mode': 'single-batch'
-        })
+        if b_mla * 2 < b_mla_peak * 0.9:
+            results.append({
+                **base_result,
+                't_{dense_layer}(us)': t_dense_layer_two,
+                't_{moe_layer}(us)': t_moe_layer_two,
+                'TPOT(ms)': tpot_two,
+                'Single-Device Throughput(Tokens/s)': throughput_two,
+                'mode': 'two-microbatch'
+            })
+        if b_mla < b_mla_peak * 0.9:
+            results.append({
+                **base_result,
+                't_{dense_layer}(us)': t_dense_layer_single,
+                't_{moe_layer}(us)': t_moe_layer_single,
+                'TPOT(ms)': tpot_single,
+                'Single-Device Throughput(Tokens/s)': throughput_single,
+                'mode': 'single-batch'
+            })
 
     # 创建DataFrame并保存结果
     results_df = pd.DataFrame(results)
