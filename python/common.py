@@ -55,6 +55,21 @@ GPUSpec = {
         "volume": 80,
         "intra_node_bw": 180,
         "inter_node_bw": 39,
+    },
+    "H200-144": {
+        "volume": 144,
+        "intra_node_bw": 380,
+        "inter_node_bw": 39,
+    },
+    "MI300X-192": {
+        "volume": 192,
+        "intra_node_bw": 315,
+        "inter_node_bw": 39,
+    },
+    "MI308X-192": {
+        "volume": 192,
+        "intra_node_bw": 315,
+        "inter_node_bw": 39,
     }
 }
 
@@ -96,7 +111,7 @@ class ModelConfig:
 @dataclass
 class TestConfig:
     device_nums: List[int] = None
-    s: int = 5000
+    s: int = 5000 # mean seqlen
     gpu: str = "H800-80"
     model_config: ModelConfig = None
     tp_nums:  List[int] = None

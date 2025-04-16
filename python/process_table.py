@@ -53,10 +53,10 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
                                (group_df['b_mla'] == b_mla) &
                                (group_df['m_per_group'] == m_per_group) &
                                (group_df['matrix_idx'] == 7)]['time_us'].iloc[0])
-        down_gemm = int(group_df[(group_df['d'] == d) &
-                                 (group_df['m_per_group'] == m_per_group) &
-                                 (group_df['b_mla'] == b_mla) &
-                                 (group_df['matrix_idx'] == 8)]['time_us'].iloc[0])
+        # down_gemm = int(group_df[(group_df['d'] == d) &
+        #                          (group_df['m_per_group'] == m_per_group) &
+        #                          (group_df['b_mla'] == b_mla) &
+        #                          (group_df['matrix_idx'] == 8)]['time_us'].iloc[0])
 
         dispatch_alltoall = int(
             config.calculate_alltoall_time(d, tp, b_mla, True))
@@ -69,15 +69,15 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
         # 计算两种模式下的层时间
         # Two microbatch overlapping
         t_moe_layer_two = int(2 * (max(dispatch_alltoall, shared_time + qkv_time) +
-                              up_gemm + down_gemm +
+                              up_gemm  +
                               max(attn_time + o_time + allreduce, combine_alltoall)))
         t_dense_layer_two = int(
-            2 * (shared_time + qkv_time + up_gemm + down_gemm + attn_time + o_time + allreduce))
+            2 * (shared_time + qkv_time + up_gemm + attn_time + o_time + allreduce))
         # Single batch comp-compute overlapping
-        t_moe_layer_single = int(max(dispatch_alltoall, shared_time) + qkv_time + up_gemm +
-                                 max(down_gemm, combine_alltoall) + attn_time + o_time + allreduce)
+        t_moe_layer_single = int(max(dispatch_alltoall, shared_time) + qkv_time +
+                                 max(up_gemm, combine_alltoall) + attn_time + o_time + allreduce)
         t_dense_layer_single = int(
-            shared_time + qkv_time + up_gemm + down_gemm + attn_time + o_time + allreduce)
+            shared_time + qkv_time + up_gemm + attn_time + o_time + allreduce)
 
         # 计算TPOT和吞吐量
         tpot_two = int((t_moe_layer_two * 58 + t_dense_layer_two * 3) / 1000)
@@ -97,7 +97,7 @@ def process_data(dense_gemm_file: str, group_gemm_file: str, batch_gemm_file: st
             'O(us)': o_time,
             'Shared(us)': shared_time,
             'Up_Gemm(us)': up_gemm,
-            'Down_Gemm(us)': down_gemm,
+            'Down_Gemm(us)': 0,
             'Dispatch_AlltoAll(us)': dispatch_alltoall,
             'Combine_AlltoAll(us)': combine_alltoall,
             'AllReduce(us)': allreduce,

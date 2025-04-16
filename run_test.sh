@@ -2,7 +2,7 @@
 set -e
 
 OUTPUT_FOLDER=${OUTPUT_FOLDER:-"results"}
-PREFIX=${PREFIX:-"H800"}
+PREFIX=${PREFIX:-"MI300X"}
 
 function parse_mla_result_to_csv {
     # Create output CSV file with header

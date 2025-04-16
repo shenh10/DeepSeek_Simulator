@@ -7,8 +7,8 @@ import torch
 from typing import Tuple, Callable
 from enum import Enum
 
-import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, set_num_sms
+# import deep_gemm
+from deepgemm_utils import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor, set_num_sms
 
 from common import TestConfig
 
@@ -100,6 +100,124 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
+
+
+block_shape = (128, 128)
+
+from aiter import gemm_a8w8_blockscale
+
+def test_aiter_gemm_asm(dtype, m, n, k):
+    dim = (m, n, k)
+    block_shape_n, block_shape_k = block_shape
+    scale_n =  (n + block_shape_n - 1) // block_shape_n
+    scale_k =  (k + block_shape_k - 1) // block_shape_k
+    x = (torch.rand((m, k), dtype=torch.float16, device="cuda")/10).to(torch.float8_e4m3fnuz)
+    weight = (torch.rand( (n, k), dtype=torch.float16, device="cuda")/10).to(torch.float8_e4m3fnuz)
+    x_scale = torch.rand([m, scale_k], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+    output = torch.zeros(
+            [x.shape[0], weight.shape[0]],
+            dtype=dtype,
+            device=x.device,
+        )
+
+    gemm_a8w8_blockscale(x, weight, x_scale, w_scale, output)
+
+
+from aiter import batched_gemm_a8w8
+
+## TODO: fix the error from aiter bmm : RuntimeError: This GEMM is not supported!
+def test_aiter_batch_gemm(dtype, b, m, n, k):
+    dim = (b, m, n, k)
+    x = torch.randint(-20, 20, (b, m, k), dtype=torch.int8).cuda()
+    weight = torch.randint(-20, 20, (b, n, k), dtype=torch.int8).cuda()
+    x_scale = torch.rand([b, m, 1], dtype=torch.float32).cuda() + 1e-6
+    w_scale = torch.rand([b, 1, n], dtype=torch.float32).cuda() + 1e-6
+    output = torch.zeros(
+            (b, m , n),
+            dtype=dtype,
+            device=x.device,
+        )
+
+    batched_gemm_a8w8(x, weight, x_scale, w_scale, output, None)
+
+
+# #TODO: bill fail back to torch.bmm 
+# # from /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py:L796
+def test_torch_batch_gemm(dtype, b, m, n, k):
+    dim = (b, m, n, k)
+    x = torch.randint(-20, 20, (b, m, k), dtype=dtype).cuda()
+    weight = torch.randint(-20, 20, (b, k, n), dtype=dtype).cuda()
+    q_nope_out = torch.bmm(x, weight)
+
+
+
+
+######################################## fused moe ########################################
+
+BLOCK_SIZE_M = 32
+quant_algo = [
+    "No",  # g1u0/ck(g1ux) support
+    "int8quant",  # g1u1 support
+    "fp8quant",  # g1u1 support
+    "int8smoothquant",  # g1u1/g1u0 support
+    "fp8smoothquant",  # g1u1 support
+    "wint4afp8smoothquant", # g1u1 support
+]
+
+from aiter import ActivationType
+from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
+from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
+from aiter import pertoken_quant, ck_moe
+from aiter.ops.shuffle import shuffle_weight
+
+
+def test_aiter_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=True, shared_E=1, activation = ActivationType.Silu):
+        quant_dtype = torch.float8_e4m3fnuz
+
+        input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+        
+        w13 = torch.randn((E+shared_E, inter_dim*2, model_dim),
+                            dtype=dtype, device="cuda") / 10.0
+        
+        w2 = torch.randn((E+shared_E, model_dim, inter_dim),
+                        dtype=dtype, device="cuda")
+        score = torch.randn((token, E), device="cuda", dtype=dtype)
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
+        if shared_E > 0:
+            shared_E_score = 0.5
+            s_topk_weights = torch.tensor([[shared_E_score, shared_E_score],] * token,
+                                        dtype=torch.float32,
+                                        device=input.device)
+            topk_weights = torch.cat((topk_weights, s_topk_weights), dim=1)
+            s_topk_ids = torch.tensor([[E, E+1],] * token,
+                                    dtype=torch.int32,
+                                    device=input.device)
+            topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
+
+        w13, fc1_scale = pertoken_quant(
+            w13, torch.float, quant_dtype=quant_dtype, dtypeMax=None)
+        w2, fc2_scale = pertoken_quant(
+            w2, torch.float, quant_dtype=quant_dtype, dtypeMax=None)
+
+        sp1 = (E+shared_E, inter_dim)
+        sp2 = (E+shared_E, model_dim)
+
+    
+        fc1_smooth_scale = None
+        fc2_smooth_scale = None
+
+        # b implement
+        w13b = shuffle_weight(w13)
+        w2b = shuffle_weight(w2)
+        
+
+        asm_moe(input, w13b, w2b, topk_weights, topk_ids,
+                                    fc1_scale, fc2_scale,
+                                    fc1_smooth_scale, fc2_smooth_scale,
+                                    a16=False, activation=activation)
+
 
 
 class PerformanceLogger:
@@ -382,24 +500,25 @@ class GEMMTester:
         print(updated_set)
         for m in m_set:
             for matrix_idx, tp, k, n in updated_set:
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-                diff = calc_diff(out, ref_out)
-                assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+                # x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                # diff = calc_diff(out, ref_out)
+                # assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
                 def test_func():
-                    x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-                    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                    test_aiter_gemm_asm(torch.bfloat16, m, n, k)
+                    # x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                    # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
                 self.run_benchmark(test_func, matrix_idx, m, n, k,
-                                   tp=tp, compute_mode=Mode.BASE, tag='fp8_gemm')
+                                   tp=tp, compute_mode=Mode.BASE, tag='_ZN2ck27kernel_gemm_xdl_cshuffle_v3INS_42GridwiseGemmMultiD_ABScale_xdl_cshuffle_v3INS_13tensor_l')
         print()
 
     def test_bmm(self, config: TestConfig, *, use_flashinfer_bmm: bool = False) -> None:
         import torch.cuda.nvtx as nvtx
         print('Testing batch GEMM:')
-        if use_flashinfer_bmm:
-            from flashinfer import bmm_fp8
+        # if use_flashinfer_bmm:
+        #     from flashinfer import bmm_fp8
         b_and_m_per_groups = config.generate_b_and_m_per_groups()
         tp_vars = config.get_tp_configs()
         m_set = sorted(
@@ -423,88 +542,103 @@ class GEMMTester:
 
         for m in m_set:
             for matrix_idx, tp, b, k, n in updated_set:
-                x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
-                    b, m, k, n)
-                if use_flashinfer_bmm:
-                    bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
-                            y_fp8[1], "torch.bfloat16", out)
-                    diff = calc_diff(out, ref_out)
-                    assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
-                    def test_func():
-                        x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
-                            b, m, k, n)
-                        bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
-                                y_fp8[1], "torch.bfloat16", out)
-                    self.run_benchmark(test_func, matrix_idx,
-                                       m, n, k, Mode.BATCH, 'cutlass')
-                else:
-                    def test_func():
-                        x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
-                            b, m, k, n)
-                        # with nvtx.range("matmul"):
-                        out = torch.bmm(x_bf16, y_bf16)
-                        # torch.cuda.synchronize()
-                        # nvtx.range_pop()
-                    # test_func()
-                    try:
-                        self.run_benchmark(
-                            test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='gemm_bf16', batch=b)
-                    except:
-                        # H20 use a strange kernel named "nvjet_tst_176x64_64x7_1x1_v_bz_TNN" to perform
-                        self.run_benchmark(
-                            test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='nvjet_tst', batch=b)
+                
+                def test_func():
+                    # test_aiter_batch_gemm(torch.bfloat16, b, m, n, k)
+                    test_torch_batch_gemm(torch.bfloat16, b, m, n, k)
+
+                self.run_benchmark(test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='Cijk_Ailk_Bljk_BBS_BH_Bias_HAS_SAV_UserArgs_MT', batch=b) ## TODO: tag cutlass is wrong!!
+
+                # x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                #     b, m, k, n)
+                # if use_flashinfer_bmm:
+                #     bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
+                #             y_fp8[1], "torch.bfloat16", out)
+                #     diff = calc_diff(out, ref_out)
+                #     assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+                #     def test_func():
+                #         x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                #             b, m, k, n)
+                #         bmm_fp8(x_fp8[0], y_fp8[0], x_fp8[1],
+                #                 y_fp8[1], "torch.bfloat16", out)
+                #     self.run_benchmark(test_func, matrix_idx,
+                #                        m, n, k, Mode.BATCH, 'cutlass')
+                # else:
+                #     def test_func():
+                #         x_bf16, y_bf16, x_fp8, y_fp8, out, ref_out = construct_bmm(
+                #             b, m, k, n)
+                #         # with nvtx.range("matmul"):
+                #         out = torch.bmm(x_bf16, y_bf16)
+                #         # torch.cuda.synchronize()
+                #         # nvtx.range_pop()
+                #     # test_func()
+                #     try:
+                #         self.run_benchmark(
+                #             test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='gemm_bf16', batch=b)
+                #     except:
+                #         # H20 use a strange kernel named "nvjet_tst_176x64_64x7_1x1_v_bz_TNN" to perform
+                #         self.run_benchmark(
+                #             test_func, matrix_idx, m, n, k, tp=tp, compute_mode=Mode.BATCH, tag='nvjet_tst', batch=b)
+
 
     def test_m_grouped_gemm_masked(self, config: TestConfig) -> None:
         print('Testing grouped masked GEMM:')
         b_and_m_per_groups = config.generate_b_and_m_per_groups()
         for d, _, num_groups, b_mla, m_per_group in b_and_m_per_groups:
-            for matrix_idx, k, n in ((7, 7168, 4096), (8, 2048, 7168)):
-                masked_m_candidates = list(filter(
-                    lambda candidate: candidate <= m_per_group,
-                    (4, 8, 16, 32, 64, 128, 192, 256, 320, 384)
-                ))
+            for matrix_idx, k, n in ((7, 2048, 7168),):
+                # masked_m_candidates = list(filter(
+                #     lambda candidate: candidate <= m_per_group,
+                #     (4, 8, 16, 32, 64, 128, 192, 256, 320, 384)
+                # ))
 
-                # Correctness testing
-                for i in range(10):
-                    x_fp8, y_fp8, out, ref_out = construct_grouped(
-                        num_groups, m_per_group, k, n, is_masked=True
-                    )
-                    masked_m = torch.empty(
-                        (num_groups,), device='cuda', dtype=torch.int)
-                    for j in range(num_groups):
-                        masked_m[j] = random.choice(masked_m_candidates)
-                    expected_m = min(
-                        int(masked_m.float().mean()) + 1, m_per_group)
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                        x_fp8, y_fp8, out, masked_m, expected_m
-                    )
+                # # Correctness testing
+                # for i in range(10):
+                #     x_fp8, y_fp8, out, ref_out = construct_grouped(
+                #         num_groups, m_per_group, k, n, is_masked=True
+                #     )
+                #     masked_m = torch.empty(
+                #         (num_groups,), device='cuda', dtype=torch.int)
+                #     for j in range(num_groups):
+                #         masked_m[j] = random.choice(masked_m_candidates)
+                #     expected_m = min(
+                #         int(masked_m.float().mean()) + 1, m_per_group)
+                #     deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+                #         x_fp8, y_fp8, out, masked_m, expected_m
+                #     )
 
-                    for j in range(num_groups):
-                        diff = calc_diff(
-                            out[j, :masked_m[j].item()],
-                            ref_out[j, :masked_m[j].item()]
-                        )
-                        assert diff < 0.001, (
-                            f'{m_per_group=}, {k=}, {n=}, {j=}, '
-                            f'masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
-                        )
+                #     for j in range(num_groups):
+                #         diff = calc_diff(
+                #             out[j, :masked_m[j].item()],
+                #             ref_out[j, :masked_m[j].item()]
+                #         )
+                #         assert diff < 0.001, (
+                #             f'{m_per_group=}, {k=}, {n=}, {j=}, '
+                #             f'masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                #         )
 
                 def test_func():
-                    x_fp8, y_fp8, out, ref_out = construct_grouped(
-                        num_groups, m_per_group, k, n, is_masked=True
-                    )
-                    masked_m = torch.ones(
-                        (num_groups,), device='cuda', dtype=torch.int) * m_per_group
-                    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                        x_fp8, y_fp8, out, masked_m, m_per_group
-                    )
+                    test_aiter_fmoe(dtype=torch.bfloat16,
+                                    token=m_per_group,
+                                    model_dim=n,
+                                    inter_dim=k,
+                                    E=num_groups,
+                                    topk=8,
+                                    quant='fp8quant',
+                                    use_g1u1=True,
+                                    shared_E=1,
+                                    activation=ActivationType.Silu)
 
                 self.run_benchmark(
-                    test_func, matrix_idx, m_per_group, n, k, tp=1, compute_mode=Mode.GROUP, tag='fp8_gemm',
+                    test_func, matrix_idx, m_per_group, n, k, tp=1, compute_mode=Mode.GROUP, tag='fmoe_fp8_g1u1_subGU_', ## TODO: fp8_gemm needs to change
                     d=d, b_mla=b_mla, num_groups=num_groups, m_per_group=m_per_group
                 )
         print()
+
+
+
+
 
 
 def parse_args():
@@ -538,8 +672,8 @@ def main():
     torch.manual_seed(0)
     random.seed(0)
 
-    print('Library path:')
-    print(f' > {deep_gemm.__path__}\n')
+    # print('Library path:')
+    # print(f' > {deep_gemm.__path__}\n')
 
     output_filename = f"{args.prefix}dense_gemm.csv" if args.prefix else "dense_gemm.csv"
     output_path = os.path.join(args.output_dir, output_filename)
